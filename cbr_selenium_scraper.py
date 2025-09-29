@@ -1,5 +1,6 @@
 import argparse
 import datetime as dt
+from datetime import datetime as _dt
 import time
 from pathlib import Path
 from typing import List, Optional
@@ -29,8 +30,6 @@ def build_url_for_date(d: dt.date) -> str:
     dstr = d.strftime("%d.%m.%Y")
     return f"{BASE_URL}?UniDbQuery.Posted=True&UniDbQuery.To={dstr}"
 
-def today_url() -> str:
-    return build_url_for_date(dt.date.today())
 
 def make_driver(headless: bool = True) -> webdriver.Chrome:
     opts = ChromeOptions()
@@ -49,6 +48,7 @@ def make_driver(headless: bool = True) -> webdriver.Chrome:
     driver.set_script_timeout(60)
     return driver
 
+
 def fetch_html_for_date(d: dt.date, headless: bool = True) -> str:
     url = build_url_for_date(d)
     driver = make_driver(headless=headless)
@@ -62,11 +62,12 @@ def fetch_html_for_date(d: dt.date, headless: bool = True) -> str:
     finally:
         driver.quit()
 
+
 def parse_table(html: str, d: dt.date) -> pd.DataFrame:
     soup = BeautifulSoup(html, "html.parser")
     table = soup.select_one("table.data")
     if table is None:
-        return pd.DataFrame(columns=["NumCode","CharCode","Nominal","Name","Value","ValuePerUnit","Date"])
+        return pd.DataFrame(columns=["NumCode", "CharCode", "Nominal", "Name", "Value", "ValuePerUnit", "Date"])
 
     rows = []
     for tr in table.select("tr")[1:]:
@@ -92,6 +93,7 @@ def parse_table(html: str, d: dt.date) -> pd.DataFrame:
         })
     return pd.DataFrame(rows)
 
+
 def collect_from_today(days: int, headless: bool) -> List[pd.DataFrame]:
     end = dt.date.today()
     dfs: List[pd.DataFrame] = []
@@ -111,6 +113,7 @@ def collect_from_today(days: int, headless: bool) -> List[pd.DataFrame]:
             print(f"[{d}] download error: {e}")
     return dfs
 
+
 def merge_wide(dfs: List[pd.DataFrame], pick: Optional[List[str]]) -> pd.DataFrame:
     if not dfs:
         return pd.DataFrame()
@@ -121,83 +124,141 @@ def merge_wide(dfs: List[pd.DataFrame], pick: Optional[List[str]]) -> pd.DataFra
     wide = wide.sort_index()
     return wide
 
+
+def calendarize_and_ffill(wide: pd.DataFrame) -> pd.DataFrame:
+    """
+    Builds a complete calendar based on wide dates and pulls the values forward (ffill),
+    so that weekends (holidays) have the rates of the previous working day.
+    """
+    if wide.empty:
+        return wide
+    idx = pd.to_datetime(wide.index)
+    full = pd.date_range(idx.min(), idx.max(), freq="D")
+    out = (wide.reindex(full.strftime("%Y-%m-%d"))
+           .apply(pd.to_numeric, errors="coerce")
+           .ffill())
+    out.index = out.index.astype(str)
+    return out
+
+
 def select_top_movers(wide: pd.DataFrame, k: int = 8) -> pd.DataFrame:
     if wide.shape[1] <= k:
         return wide
-
-    rel = wide.pct_change().dropna()
-    movers = rel.std().sort_values(ascending=False).head(k).index
+    rel = wide.pct_change().dropna(how="all", axis=0)
+    movers = rel.std(numeric_only=True).sort_values(ascending=False).head(k).index
     return wide[movers]
 
+
+def _unique_plot_path(kind: str, wide: pd.DataFrame) -> Path:
+    idx = pd.to_datetime(wide.index)
+    start = idx.min().date().isoformat()
+    end = idx.max().date().isoformat()
+    dcount = idx.normalize().nunique()
+    ts = _dt.now().strftime("%Y%m%d-%H%M%S")
+    fname = f"cbr_plot_{kind}_d{dcount}_{start}_{end}_{ts}.png"
+    out = DATA_DIR / fname
+    out.parent.mkdir(parents=True, exist_ok=True)
+    return out
+
+
 def plot_wide(
-    wide: pd.DataFrame,
-    out_png: Path,
-    mode: str = "indexed",   # 'indexed' или 'absolute'
-    top_k: int = 8,
-    force_all: bool = False
+        wide: pd.DataFrame,
+        out_png: Path,
+        mode: str = "absolute",  # 'absolute', 'delta', 'indexed'
+        top_k: int = 8,
+        force_all: bool = False
 ) -> None:
     if wide.empty:
         print("No data for plot.")
         return
 
-    data = wide.copy()
+    data = calendarize_and_ffill(wide.copy())
+
     if not force_all and data.shape[1] > top_k:
         data = select_top_movers(data, k=top_k)
 
+    data = data.sort_index().apply(pd.to_numeric, errors="coerce")
     x = pd.to_datetime(data.index)
 
     if mode.lower() == "indexed":
         base = data.iloc[0]
-        data = (data.divide(base) * 100.0)
-        y_label = "Index (day1 = 100)"
-        title = "CBRF rates - indexed (day 1 = 100)"
+        data = data.divide(base) * 100.0
+        y_label = "Index (first calendar day = 100)"
+        title = "CBRF rates — indexed"
+        line_kwargs = dict(linewidth=1.4, markersize=3.2, marker="o", alpha=0.95)
+
+    elif mode.lower() == "delta":
+        base = data.iloc[0]
+        data = data.subtract(base)
+        y_label = "delta RUB vs first day"
+        title = "CBRF rates — delta RUB to first calendar day"
+        line_kwargs = dict(linewidth=1.6, alpha=0.95)
+
     else:
-        y_label = "RUB for 1 unit"
-        title = "Rates CBRF (rub/1 unit)"
+        y_label = "RUB per 1 unit"
+        title = "CBRF rates (RUB per 1)"
+        line_kwargs = dict(linewidth=1.5, alpha=0.95)
 
-    fig, ax = plt.subplots(figsize=(11, 5.5))
+    fig, ax = plt.subplots(figsize=(12, 6.8), constrained_layout=True)
     for col in data.columns:
-        ax.plot(x, data[col], marker="o", linewidth=1.8, markersize=4, alpha=0.9, label=col)
+        ax.plot(x, data[col], label=col, **line_kwargs)
 
-    ax.set_title(title, pad=12)
-    ax.set_xlabel("Data")
+    ax.set_title(title, pad=10)
+    ax.set_xlabel("Date")
     ax.set_ylabel(y_label)
     ax.grid(True, alpha=0.3)
+    fig.autofmt_xdate(rotation=28, ha="right")
     ax.margins(x=0.02, y=0.08)
-    fig.autofmt_xdate(rotation=30, ha="right")
 
+    n_series = data.shape[1]
+    ncol = 6 if n_series > 40 else 5 if n_series > 28 else 4 if n_series > 20 else 3
     ax.legend(
-        loc="upper left",
-        bbox_to_anchor=(1.02, 1.0),
-        borderaxespad=0.0,
-        frameon=True
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.16),
+        ncol=ncol,
+        frameon=True,
+        fontsize=8
     )
+    fig.subplots_adjust(bottom=0.24 if n_series > 12 else 0.18)
 
-    fig.tight_layout(rect=[0, 0, 0.82, 1])
     out_png.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_png, dpi=150)
+    fig.savefig(out_png, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"[INFO] Plot saved: {out_png}")
+    print(f"Saved chart: {out_png}")
+
 
 def main():
-    ap = argparse.ArgumentParser(description="Scraper CBRF: for current date back to N days")
+    ap = argparse.ArgumentParser(description="CBRF scraper: from today back N days")
     ap.add_argument("--days", type=int, default=7, help="How many days to collect starting from today (default 7)")
-    ap.add_argument("--headless", action="store_true", default=False, help="Without GUI browser")
-    ap.add_argument("--pick", nargs="*", default=None, help="Which currencies to withdraw")
+    ap.add_argument("--headless", action="store_true", default=False, help="Run browser headless")
+    ap.add_argument("--pick", nargs="*", default=None, help="Which currencies to plot (e.g. USD EUR CNY)")
+    ap.add_argument("--all", dest="force_all", action="store_true", default=False,
+                    help="Plot all currencies even if there are many")
+    ap.add_argument("--indexed", action="store_true", help="Additionally save an indexed chart")
+    ap.add_argument("--delta", action="store_true", help="Additionally save a delta RUB chart (vs first calendar day)")
     args = ap.parse_args()
 
     dfs = collect_from_today(days=args.days, headless=args.headless)
     if not dfs:
-        print("No data recieved.")
+        print("No data collected.")
         return
 
     wide = merge_wide(dfs, pick=args.pick)
     out_csv = DATA_DIR / "week_merged.csv"
     wide.to_csv(out_csv, encoding="utf-8")
-    print(f"[INFO] Merged table saved: {out_csv}")
+    print(f"Saved merged table: {out_csv}")
 
-    out_png = DATA_DIR / "week_plot.png"
-    plot_wide(wide, out_png)
+    abs_png = _unique_plot_path("absolute", wide)
+    plot_wide(wide, abs_png, mode="absolute", top_k=8, force_all=args.force_all)
+
+    if args.delta:
+        dlt_png = _unique_plot_path("delta", wide)
+        plot_wide(wide, dlt_png, mode="delta", top_k=8, force_all=args.force_all)
+
+    if args.indexed:
+        idx_png = _unique_plot_path("indexed", wide)
+        plot_wide(wide, idx_png, mode="indexed", top_k=8, force_all=args.force_all)
+
 
 if __name__ == "__main__":
     main()
