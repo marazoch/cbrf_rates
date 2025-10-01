@@ -71,6 +71,8 @@ python bot/bot.py
 
 
 Examples of bot working:
+
+
 ![START](jpeg_readme/bot1.jpg)
 ![LATEST](jpeg_readme/bot_latest.jpg)
 ![RANGE](jpeg_readme/bot_range.jpg)
