@@ -1,9 +1,8 @@
-import os
 from pathlib import Path
 from typing import Annotated, List, Literal, Optional
 
 import pandas as pd
-from fastapi import FastAPI, HTTPException, Query, Body, status
+from fastapi import FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -23,7 +22,6 @@ REST API для доступа к курсам валют ЦБ РФ, собра�
 """,
 )
 
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -31,7 +29,6 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
-
 
 _df: Optional[pd.DataFrame] = None
 
@@ -44,21 +41,29 @@ def _load_csv_folder(folder: Path) -> pd.DataFrame:
     if not files:
         raise FileNotFoundError(f"No CSV files found in {folder}")
 
-    dfs = []
     use_cols = ["NumCode", "CharCode", "Nominal", "Name", "Value", "ValuePerUnit", "Date"]
+    dfs: list[pd.DataFrame] = []
     for f in files:
         try:
-            d = pd.read_csv(f, dtype=str, usecols=use_cols)
+            d = pd.read_csv(f, dtype=str, usecols=use_cols, encoding="utf-8")
         except Exception:
-            d = pd.read_csv(f, dtype=str)
+            d = pd.read_csv(f, dtype=str, encoding="utf-8")
             d = d[[c for c in use_cols if c in d.columns]]
         dfs.append(d)
 
     df = pd.concat(dfs, ignore_index=True)
+
+
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.strftime(DATE_FMT)
     df["Nominal"] = pd.to_numeric(df["Nominal"], errors="coerce")
     df["ValuePerUnit"] = pd.to_numeric(df["ValuePerUnit"], errors="coerce")
+
+    # валидные строки
     df = df.dropna(subset=["Date", "CharCode", "ValuePerUnit"]).copy()
+
+    # коды в верхний регистр и без пробелов
+    df["CharCode"] = df["CharCode"].astype(str).str.strip().str.upper()
+
     return df
 
 
@@ -70,6 +75,8 @@ def _ensure_loaded():
 
 def _latest_date() -> str:
     _ensure_loaded()
+    if _df.empty:
+        raise HTTPException(404, detail="No data loaded")
     dates = pd.to_datetime(_df["Date"], errors="coerce")
     return dates.max().strftime(DATE_FMT)
 
@@ -81,18 +88,22 @@ class RateItem(BaseModel):
     nominal: Optional[int] = Field(None, description="Номинал (сколько единиц в курсе)")
     value_per_unit: float = Field(..., description="Курс в рублях за 1 единицу")
 
+
 class RatesResponse(BaseModel):
     total: int
     limit: int
     offset: int
     items: List[RateItem]
 
+
 class DatesResponse(BaseModel):
     dates: List[str]
+
 
 class RangePoint(BaseModel):
     date: str
     value_per_unit: float
+
 
 class RangeResponse(BaseModel):
     code: str
@@ -104,28 +115,33 @@ class RangeResponse(BaseModel):
     items: List[RangePoint]
 
 
-
 @app.get("/health", tags=["system"])
 def health():
     return {"status": "ok"}
 
+
 @app.post("/reload", tags=["system"], status_code=status.HTTP_202_ACCEPTED)
 def reload_data():
-    """Ручная перезагрузка из CSV (вызвать после нового прогона скрапера)."""
     global _df
     _df = _load_csv_folder(DATA_DIR)
     return {"status": "reloaded", "rows": int(_df.shape[0])}
 
-@app.get("/dates", response_model=DatesResponse, tags=["data"])
-def list_dates():
-    """Список доступных дат (новейшие первыми)."""
+
+@app.get("/dates", response_model=DatesResponse, response_model_exclude_none=True, tags=["data"])
+def list_dates(
+    limit: Annotated[int, Query(ge=1, le=MAX_LIMIT_DEFAULT, description="Сколько последних дат вернуть")] = 50
+):
     _ensure_loaded()
-    dates = sorted(_df["Date"].unique(), reverse=True)
+    if _df.empty:
+        return DatesResponse(dates=[])
+    dates = sorted(_df["Date"].unique(), reverse=True)[:limit]
     return DatesResponse(dates=dates)
+
 
 @app.get(
     "/rates",
     response_model=RatesResponse,
+    response_model_exclude_none=True,
     tags=["data"],
     summary="Срез курсов за одну дату (или последнюю)",
 )
@@ -143,19 +159,11 @@ def get_rates(
     limit: Annotated[int, Query(ge=1, le=MAX_LIMIT_DEFAULT)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
 ):
-    """
-    Возвращает **небольшой** срез курсов за одну дату.
-    Примеры:
-    - `/rates?date=2025-09-29&codes=USD,EUR`
-    - `/rates?codes=USD,EUR&sort_by=value_per_unit&order=desc&limit=20`
-    """
     _ensure_loaded()
 
-    # дата
     if date is None:
         date = _latest_date()
     else:
-        # валидация формата
         try:
             pd.to_datetime(date, format=DATE_FMT)
         except Exception:
@@ -165,18 +173,18 @@ def get_rates(
     if df.empty:
         raise HTTPException(404, detail=f"No data for date {date}")
 
-    # фильтр по кодам
     if codes:
         wanted = {c.strip().upper() for c in codes.split(",") if c.strip()}
-        df = df[df["CharCode"].str.upper().isin(wanted)]
+        df = df[df["CharCode"].isin(wanted)]
 
-    # сортировка
-    key_map = {
-        "char_code": "CharCode",
-        "name": "Name",
-        "value_per_unit": "ValuePerUnit",
-    }
-    df = df.sort_values(key_map[sort_by], ascending=(order == "asc"))
+    key_map = {"char_code": "CharCode", "name": "Name", "value_per_unit": "ValuePerUnit"}
+    if sort_by == "name":
+        df = df.copy()
+        df["_NameSort"] = df["Name"].fillna("")
+        df = df.sort_values("_NameSort", ascending=(order == "asc"))
+        df = df.drop(columns=["_NameSort"])  # чистим временную колонку
+    else:
+        df = df.sort_values(key_map[sort_by], ascending=(order == "asc"))
 
     total = int(df.shape[0])
     df = df.iloc[offset : offset + limit]
@@ -185,7 +193,7 @@ def get_rates(
         RateItem(
             date=row["Date"],
             char_code=row["CharCode"],
-            name=row.get("Name"),
+            name=(row["Name"] if pd.notna(row["Name"]) else None),
             nominal=int(row["Nominal"]) if pd.notna(row["Nominal"]) else None,
             value_per_unit=float(row["ValuePerUnit"]),
         )
@@ -194,9 +202,11 @@ def get_rates(
 
     return RatesResponse(total=total, limit=limit, offset=offset, items=items)
 
+
 @app.get(
     "/range",
     response_model=RangeResponse,
+    response_model_exclude_none=True,
     tags=["data"],
     summary="Временной ряд для одной валюты за период",
 )
@@ -211,11 +221,6 @@ def get_range(
     offset: Annotated[int, Query(ge=0)] = 0,
     order: Literal["asc", "desc"] = Query("asc", description="Порядок по дате."),
 ):
-    """
-    Возвращает временной ряд `date -> value_per_unit` для одной валюты.
-    - `agg` нужен на всякий случай, если в данных по одной дате несколько строк.
-    - Результат **пагинируется**, максимум `MAX_LIMIT_DEFAULT` точек за ответ.
-    """
     _ensure_loaded()
 
     code = code.strip().upper()
@@ -228,7 +233,7 @@ def get_range(
     if end_dt < start_dt:
         raise HTTPException(400, detail="'end' must be >= 'start'")
 
-    df = _df[_df["CharCode"].str.upper() == code].copy()
+    df = _df[_df["CharCode"] == code].copy()
     if df.empty:
         raise HTTPException(404, detail=f"Unknown currency code '{code}'")
 
@@ -238,30 +243,22 @@ def get_range(
     if df.empty:
         return RangeResponse(code=code, start=start, end=end, total=0, limit=limit, offset=offset, items=[])
 
-    # чистим и агрегируем по дате при необходимости
+    # для корректного first/last сортируем по времени до агрегации
+    df = df.sort_values(["DateTS"])
+
     if agg:
-        aggs = {
-            "first": "first",
-            "last": "last",
-            "min": "min",
-            "max": "max",
-            "mean": "mean",
-        }
+        agg_map = {"first": "first", "last": "last", "min": "min", "max": "max", "mean": "mean"}
         df = (
-            df.groupby("Date", as_index=False)["ValuePerUnit"]
-            .agg(aggs[agg])
-            .rename(columns={"ValuePerUnit": "ValuePerUnit"})
+            df.groupby("Date", as_index=False, sort=True)["ValuePerUnit"]
+            .agg(agg_map[agg])
+            .rename(columns={"ValuePerUnit": "ValuePerUnit"})  # косметика, сохраняем то же имя
         )
         df["DateTS"] = pd.to_datetime(df["Date"], errors="coerce")
-
 
     df = df.sort_values("DateTS", ascending=(order == "asc"))
 
     total = int(df.shape[0])
     df = df.iloc[offset : offset + limit]
 
-    items = [
-        RangePoint(date=row["Date"], value_per_unit=float(row["ValuePerUnit"]))
-        for _, row in df.iterrows()
-    ]
+    items = [RangePoint(date=row["Date"], value_per_unit=float(row["ValuePerUnit"])) for _, row in df.iterrows()]
     return RangeResponse(code=code, start=start, end=end, total=total, limit=limit, offset=offset, items=items)
